@@ -31,8 +31,9 @@
 #include "I2C_Com.h"
 //#include "uart.h"
 
-#define SAA_SLV_ADDR               0x70
-#define DAC_SLV_ADDR               0x1A
+#define LED_SLV_ADDR               0x70
+#define DAC_SLV_ADDR               0x36  //0x34 on 2.1 and lower boards
+#define DAC_SLV_READ_ADDR               0x37  //0x35 on 2.1 and lower boards
 #define INA_SLV_ADDR               0x80
 
 #define MASKLED0                   0x3F
@@ -56,6 +57,9 @@ void Contruct_Send_Message(int valueV, int valueA);
 void Data_TX (void);
 void Data_RX (void);
 
+void MSB_Off(void);
+void MSB_On(void);
+
 #define WAKE_UP_UART_CODE       0xBE
 #define WAKE_UP_UART_CODE2      0xEF
 #define SLEEP_MODE_UART_CODE    0xDE
@@ -73,17 +77,21 @@ void Data_RX (void);
 #define MAX_IDLE_TIME           200
 #define PROXIMITY_THRESHOLD     60
 
+#define MaxDACSetting           330
+#define MinDACSetting           0;
+
 unsigned int wheel_position=ILLEGAL_SLIDER_WHEEL_POSITION, last_wheel_position=ILLEGAL_SLIDER_WHEEL_POSITION;
 unsigned int deltaCnts[4];
 unsigned int prox_raw_Cnts;
 
 //int I2C_State, Bytecount, Transmit = 0;     // State variable
-int dataSAAMsg[6] = {0x00,0x57,MASKLED0,MASKLED6,MASKLED7,MASKLED9};
-int dataDACMsg[2] = {0x0C,0xFF};
+int dataLedMsg[6] = {0x20,0x00,0x00,0x00,0x00,0x00};
+int dataLedSegments[2] = {0x24, 0x00};
+int dataDACMsg[3] = {0x00,0x00,0x00};
 int dataINAValue[4] = {0x00,0x00,0x00,0x00};
 int firstTouchLocation = 0;
 int lastPosition = 0;
-int voltage = 4095;
+int voltage = 1023;
 int firstTouch = 1;
 int useAsSlider = 0;
 int powerOn = 0;
@@ -91,7 +99,11 @@ int ledCycle = 0;
 int mode = 0;
 int blinkUpdate = 0;
 int milidelay = 0;
-
+int busVoltage = 0;
+int shuntVoltage = 0;
+int decimalPlace = 0;
+int miliDecimal = 0;
+int msbOn = 0;
 
 #define MODE_VOLTS                   0x00
 #define MODE_AMPS                    0x01
@@ -100,23 +112,6 @@ int milidelay = 0;
 #define MODE_OFF                   0x00
 #define MODE_ON                    0x01
 #define MODE_FIXED		           0x02
-
-const unsigned char ledNumbers[11] =
-                                {
-								    MASKLED0,
-								    MASKLED1,
-								    MASKLED2,
-								    MASKLED3,
-								    MASKLED4,
-								    MASKLED5,
-								    MASKLED6,
-								    MASKLED7,
-								    MASKLED8,
-								    MASKLED9,
-								    MASKLEDOFF
-								   };
-
-
 
 #define MASK7                   BIT4
 #define MASK6                   BIT5
@@ -159,10 +154,98 @@ void InitPuppy(void)
   BCSCTL3 |= LFXT1S_2;                  // LFXT1 = VLO  
   
   // Port init
-  P1OUT &= ~BIT0;
   P1OUT |= (BIT6+BIT7);
-  P1DIR |= (BIT5+BIT4+BIT3+BIT2+BIT0);  // set P1.0 P1.2 P1.3 P1.4 P1.5 as outputs
+  P1OUT &= ~BIT5;
+  P1DIR |= BIT5;  // P1.5 as outputs
   P1REN |= 0xC0;   // P1.6 & P1.7 Pullups, others to 0
+}
+
+/* ----------------InitPuppy--------------------------------------
+ * Setup initial clock and port settings
+ *
+ * ------------------------------------------------------------------------*/
+void InitLedDriver(void)
+
+{
+	dataINAValue[0] = 0x04;		//Configuration Register
+	dataINAValue[1] = 0x01;		//Normal operation mode (defaults to 0x00 which is shutdown mode)
+	I2C_Master_Transmit(LED_SLV_ADDR,dataINAValue,2);
+
+	dataINAValue[0] = 0x01; 	//Decode Mode Register
+	dataINAValue[1] = 0x0F;		//Decode Digits 1,2,3,4 (defaults to 0x00, for no decode)
+	I2C_Master_Transmit(LED_SLV_ADDR,dataINAValue,2);
+
+	dataINAValue[0] = 0x02;		//Intensity Regiter
+	dataINAValue[1] = 0x2A;		//Set to 42/64(15.1mA) of Max (22.6mA)
+	I2C_Master_Transmit(LED_SLV_ADDR,dataINAValue,2);
+
+	dataINAValue[0] = 0x24;		//Segments Register
+	dataINAValue[1] = 0x00;		//All segments off
+	I2C_Master_Transmit(LED_SLV_ADDR,dataINAValue,2);
+}
+
+void InitDAC(void)
+
+{
+	 P1OUT &= ~BIT5;  //Turns off the Output by shutting down brownout detector
+	 P1OUT |= BIT5;
+	 dataDACMsg[0] = 0x35;  //End
+	 dataDACMsg[1] = 0x00;
+	 dataDACMsg[2] = 0x00;
+	 I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+	dataDACMsg[0] = 0x2D;  //Ref on/output/2.5v
+	dataDACMsg[1] = 0x00;
+	dataDACMsg[2] = 0x00;
+	I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+	dataDACMsg[0] = 0x00;  //Ref on/output/2.5v
+		 	dataDACMsg[1] = 0x00;
+		 	dataDACMsg[2] = 0x00;
+		 I2C_Master_Recieve(DAC_SLV_ADDR,dataDACMsg,3);
+
+	dataDACMsg[0] = 0x40;  //Normal Power operation
+		dataDACMsg[1] = 0x00;
+		dataDACMsg[2] = 0x00;
+		I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+		dataDACMsg[0] = 0x60;  //Set output to full on reset
+				dataDACMsg[1] = 0x00;
+				dataDACMsg[2] = 0x60;
+				I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+	dataDACMsg[0] = 0x50;  //Config Aux off
+	dataDACMsg[1] = 0x00;
+	dataDACMsg[2] = 0x38;
+	I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+	dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+	dataDACMsg[1] = 0xFF; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+	dataDACMsg[2] = 0xC0;
+	I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+	voltage = 1023;
+	          dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+	          dataDACMsg[1] = (voltage >> 2) & 0x00FF; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+	          dataDACMsg[2] = (voltage << 6) & 0x00FF;
+	          I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+	          dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+	          	dataDACMsg[1] = 0x55; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+	          	dataDACMsg[2] = 0xC0;
+	          	I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+	          	voltage = 500;
+	          	          dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+	          	          dataDACMsg[1] = (voltage >> 2) & 0x00FF; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+	          	          dataDACMsg[2] = (voltage << 6) & 0x00FF;
+	          	          I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+	          	          voltage = 1;
+	          	        dataDACMsg[0] = 0x30;  //End
+	          	        		dataDACMsg[1] = 0x00;
+	          	        		dataDACMsg[2] = 0x00;
+	          	        		I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
 }
 
 /* ----------------UpdateLeds--------------------------------------
@@ -171,43 +254,45 @@ void InitPuppy(void)
  * ------------------------------------------------------------------------*/
 void UpdateLeds()
 {
-		if(powerOn == MODE_ON)
-		{
-			P1OUT |= BIT5;
-			P1OUT |= BIT0;
-		}
-		else if(powerOn == MODE_FIXED)
-		{
-			P1OUT |= BIT0;
-			if (blinkUpdate < 3)
+	if(powerOn == MODE_ON)
 			{
-				P1OUT |= BIT5;
+		dataLedSegments[1] |= BIT3;
+		P1OUT |= BIT5;
 			}
-			else
+	else if(powerOn == MODE_FIXED)
 			{
-				P1OUT &= ~BIT5;
-			}
-			blinkUpdate++;
-			if(blinkUpdate >4)
-				blinkUpdate = 0;
-		}
-		else
-		{
-			P1OUT &= ~BIT5;
-			P1OUT &= ~BIT0;
-		}
-		if(mode == MODE_WATTS)
-			P1OUT |= BIT4;
-		else
-			P1OUT &= ~BIT4;
-		if(mode == MODE_AMPS)
-			P1OUT |= BIT3;
-		else
-			P1OUT &= ~BIT3;
-		if(mode == MODE_VOLTS)
-			P1OUT |= BIT2;
-		else
-			P1OUT &= ~BIT2;
+		P1OUT |= BIT5;
+				if (blinkUpdate < 3)
+				{
+					dataLedSegments[1] |= BIT3;
+				}
+				else
+				{
+					dataLedSegments[1] &= ~BIT3;
+				}
+				blinkUpdate++;
+				if(blinkUpdate >4)
+					blinkUpdate = 0;
+	}
+	else
+	{
+		P1OUT &= ~BIT5;
+		dataLedSegments[1] &= ~BIT3;
+	}
+	if(mode == MODE_WATTS)
+		dataLedSegments[1] |= BIT2;
+	else
+		dataLedSegments[1] &= ~BIT2;
+	if(mode == MODE_AMPS)
+		dataLedSegments[1] |= BIT1;
+	else
+		dataLedSegments[1] &= ~BIT1;
+	if(mode == MODE_VOLTS)
+		dataLedSegments[1] |= BIT0;
+	else
+		dataLedSegments[1] &= ~BIT0;
+
+	I2C_Master_Transmit(LED_SLV_ADDR,dataLedSegments,2);
 }
 
  
@@ -240,6 +325,9 @@ void main(void)
   WDTCTL = WDTPW + WDTHOLD;             // Stop watchdog timer
   
   InitPuppy();
+  InitLedDriver();
+  InitDAC();
+
   //I2C_State = 0;
   
   /* Set DCO to 1MHz */
@@ -249,10 +337,18 @@ void main(void)
   BCSCTL2 |= DIVS_3;
 
   /* Set the DAC to max voltage to set the output voltage to a minimum value */
-  voltage = 4095;
-  dataDACMsg[0] = (voltage >> 8);
-  dataDACMsg[1] = voltage & 0x00FF;
-  I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,2);
+  voltage = 1023;
+  //dataDACMsg[0] = (voltage >> 8);
+  //dataDACMsg[1] = voltage & 0x00FF;
+  //I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,2);
+
+
+
+
+        P1OUT |= BIT5;
+        //P1OUT &= ~BIT5;
+
+
 
   /* Setup the INA 219 power monitor */
   dataINAValue[0] = 0x05;
@@ -274,17 +370,37 @@ void main(void)
   BCSCTL2 |= DIVS_3;
   TACCTL0 &= ~CCIE;
 
+  voltage = 500;
   while (1)
   {
+/*
+	  if(voltage == 1023)
+		  up = 0;
+	  if(voltage == 0)
+		  up = 1;
+
+	  if(up)
+		  voltage++;
+	  else
+		  voltage--;
+	  //voltage = 1023;
+
+		  	          dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+		  	          dataDACMsg[1] = (voltage >> 2) & 0x00FF; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+		  	          dataDACMsg[2] = (voltage << 6) & 0x00FF;
+		  	          I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
+*/
+
+
+
 	  wheel_position = ILLEGAL_SLIDER_WHEEL_POSITION;
       wheel_position = TI_CAPT_Slider(&voltage_slider);
-      if (updateDelay > 28)
+      if (updateDelay > 28) //was 28
       {
-    	  int busVoltage;
-          int shuntVoltage;
           updateDelay = 0;
-          UpdateLeds();
 
+          //Read Shunt Voltage
           dataINAValue[0] = 0x01;
           I2C_Master_Transmit(INA_SLV_ADDR,dataINAValue,1);
           dataINAValue[0] = 0xFFFF;
@@ -294,6 +410,7 @@ void main(void)
           dataINAValue[0] = dataINAValue[0] + dataINAValue[1];
           shuntVoltage = dataINAValue[0];
 
+          //Read Bus Voltage
           dataINAValue[0] = 0x02;
           I2C_Master_Transmit(INA_SLV_ADDR,dataINAValue,1);
           dataINAValue[0] = 0xFFFF;
@@ -303,12 +420,12 @@ void main(void)
           dataINAValue[0] = dataINAValue[0] + dataINAValue[1];
           dataINAValue[0] = dataINAValue[0] >> 3;
           busVoltage = dataINAValue[0];
-
-          Contruct_Send_Message(busVoltage, shuntVoltage);
-          //Contruct_Send_Message(lastPosition);
-          //UpdateLeds();
-          I2C_Master_Transmit(SAA_SLV_ADDR,dataSAAMsg,6);
       }
+      if ((updateDelay % 30) == 0) //was 28
+            {
+    	  UpdateLeds();
+      Contruct_Send_Message(busVoltage, shuntVoltage);
+            }
       updateDelay++;
 
       if(wheel_position != ILLEGAL_SLIDER_WHEEL_POSITION)
@@ -329,14 +446,17 @@ void main(void)
         	  sliderDelta = 0;
 
           lastPosition = wheel_position;
-          voltage +=  (4095/256) * sliderDelta;
+          voltage +=  1 * sliderDelta;
           if(voltage < 0 )
         	  voltage = 0;
-          if( voltage > 4095)
-        	  voltage = 4095;
-          dataDACMsg[0] = (voltage >> 8);
-          dataDACMsg[1] = voltage & 0x00FF;
-          I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,2);
+          if( voltage > 1023)
+        	  voltage = 1023;
+
+
+          dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+          dataDACMsg[1] = (voltage >> 2) & 0x00FF; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+          dataDACMsg[2] = (voltage << 6) & 0x00FF;
+          I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
       }
       else  /* no slider position was detected */
       {
@@ -344,25 +464,32 @@ void main(void)
     	  {
     		  if(firstTouchLocation < 8)
     		  {
-    			  voltage +=  16;
+    			  voltage +=  4;
     			  if(voltage < 0 )
     				  voltage = 0;
-      		      if( voltage > 4095)
-      		    	  voltage = 4095;
-      		      dataDACMsg[0] = (voltage >> 8);
-      		      dataDACMsg[1] = voltage & 0x00FF;
-      		      I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,2);
+      		      if( voltage > 1023)
+      		    	  voltage = 1023;
+
+
+      		    dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+      		  dataDACMsg[1] = (voltage >> 2) & 0x00FF; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+      		dataDACMsg[2] = (voltage << 6) & 0x00FF;
+      		    	I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
+
     		  }
     		  else if(firstTouchLocation > 16)
     		  {
-    			  voltage -=  16;
+    			  voltage -=  4;
     			  if(voltage < 0 )
     				  voltage = 0;
-      		      if( voltage > 4095)
-      		    	  voltage = 4095;
-      		      dataDACMsg[0] = (voltage >> 8);
-      		      dataDACMsg[1] = voltage & 0x00FF;
-      		      I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,2);
+      		      if( voltage > 1023)
+      		    	  voltage = 1023;
+
+
+      		    dataDACMsg[0] = 0xA0;  //CODE and LOAD Command
+      		          		  dataDACMsg[1] = (voltage >> 2) & 0x00FF; //top 10 bytes are the only ones used, so this is full on )which equalls puppy power output at minimum
+      		          		dataDACMsg[2] = (voltage << 6) & 0x00FF;
+      		          		    	I2C_Master_Transmit(DAC_SLV_ADDR,dataDACMsg,3);
     		  }
     	  }
     	  firstTouch = 1;
@@ -440,20 +567,23 @@ void Contruct_Send_Message(int valueV, int valueA)
 	if(mode == MODE_VOLTS)
 	{
 		valueV = 4 * valueV;
-		dataSAAMsg[2] = ledNumbers[valueV/10000];
+		dataLedMsg[4] = valueV/10000;
 		a = valueV/10000;
 		valueV = valueV - 10000*(a);
-		dataSAAMsg[3] = ledNumbers[valueV/1000];
+		dataLedMsg[3] = valueV/1000;
 		a = valueV/1000;
 		valueV = valueV - 1000*(a);
-		dataSAAMsg[4] = ledNumbers[valueV/100];
+		dataLedMsg[2] = valueV/100;
 		a = valueV/100;
 		valueV = valueV - 100*(a);
-		dataSAAMsg[5] = ledNumbers[valueV/10];
+		dataLedMsg[1] = valueV/10;
 		a = valueV/10;
 		valueV = valueV - 10*(a);
-		dataSAAMsg[2] = 0x00;
-		dataSAAMsg[3] |= 0x80;
+		decimalPlace = 0x40;
+		miliDecimal = 0;
+		MSB_Off();
+
+		//dataLedSegments[1] |= 0x80;
 	}
 	else if(mode == MODE_WATTS)
 	{
@@ -461,7 +591,9 @@ void Contruct_Send_Message(int valueV, int valueA)
 		decimal = 2;
 		if(milidelay >1)
 			decimal = 0;
-		dvalue = (long)valueA * 556;
+		dvalue = (long)valueA * 667;  	//I = V/R
+										//for .18ohm   I = V * (1/.18) * 10  =  I = V * 556
+										//for .15ohm   I = V * (1/.15) * 10  =  I = V * 667
 		dvalue = (dvalue / 100);
 		dvalue = dvalue * (long)4 * (long)valueV;
 		dvalue = (dvalue / 100);
@@ -480,6 +612,8 @@ void Contruct_Send_Message(int valueV, int valueA)
 		else if( dvalue > 99999)
 		{
 			dvalue = (dvalue / 100);
+			decimalPlace = 0x80;
+						miliDecimal = 1;
 			decimal = 4;
 			if(milidelay >1)
 				decimal = 0;
@@ -487,37 +621,41 @@ void Contruct_Send_Message(int valueV, int valueA)
 		else if( dvalue > 9999)
 		{
 			dvalue = (dvalue / 10);
-			decimal = 3;
-			if(milidelay >1)
-				decimal = 0;
+			decimalPlace = 0x40;
+			miliDecimal = 1;
+			//decimal = 3;
+			//if(milidelay >1)
+				//decimal = 0;
 		}
 		valueA = (int)dvalue;
-		if(valueA > 999)
-			dataSAAMsg[2] = ledNumbers[valueA/1000];
-		else
-			dataSAAMsg[2] = ledNumbers[0]; // Turn off first LED
+		//if(valueA > 999)
+		dataLedMsg[4] = valueA/1000;
+		//else
+		//	dataSAAMsg[2] = ledNumbers[0]; // Turn off first LED
 		a = valueA/1000;
 		valueA = valueA - 1000*(a);
-		dataSAAMsg[3] = ledNumbers[valueA/100];
+		dataLedMsg[3] = valueA/100;
 		a = valueA/100;
 		valueA = valueA - 100*(a);
-		dataSAAMsg[4] = ledNumbers[valueA/10];
+		dataLedMsg[2] = valueA/10;
 		a = valueA/10;
 		valueA = valueA - 10*(a);
-		dataSAAMsg[5] = ledNumbers[valueA/1];
+		dataLedMsg[1] = valueA/1;
 		a = valueA/1;
 		valueA = valueA - 1*(a);
 		if(decimal != 0)
-			dataSAAMsg[decimal] |= 0x80;
+			dataLedSegments[1] |= 0x80;
+		MSB_Off();
 	}
 	else if(mode == MODE_AMPS)
 	{
+		MSB_Off();
 		decimal = 3;
 		if(milidelay >1)
 								decimal = 0;
 		//if(milidelay >1)
 		//	decimal = 3;
-		dvalue = (long)valueA * 556;
+		dvalue = (long)valueA * 667;
 		dvalue = (dvalue / 100);
 		if( dvalue > 99999)
 		{
@@ -533,22 +671,71 @@ void Contruct_Send_Message(int valueV, int valueA)
 		}
 		valueA = (int)dvalue;
 		if(valueA > 999)
-			dataSAAMsg[2] = ledNumbers[valueA/1000];
-		else
-			dataSAAMsg[2] = ledNumbers[10]; // Turn off first LED
+			dataLedMsg[2] = valueA/1000;
+		//else
+		//	dataSAAMsg[2] = ledNumbers[10]; // Turn off first LED
 		a = valueA/1000;
 		valueA = valueA - 1000*(a);
-		dataSAAMsg[3] = ledNumbers[valueA/100];
+		dataLedMsg[3] = valueA/100;
 		a = valueA/100;
 		valueA = valueA - 100*(a);
-		dataSAAMsg[4] = ledNumbers[valueA/10];
+		dataLedMsg[4] = valueA/10;
 		a = valueA/10;
 		valueA = valueA - 10*(a);
-		dataSAAMsg[5] = ledNumbers[valueA/1];
+		dataLedMsg[5] = valueA/1;
 		a = valueA/1;
 		valueA = valueA - 1*(a);
 		if(decimal != 0)
-			dataSAAMsg[decimal] |= 0x80;
+			dataLedMsg[decimal] |= 0x80;
+		MSB_Off();
+
+		//DEBUG READ DAQ SETTINGS
+		/*
+				valueV = voltage * 10;
+				dataLedMsg[4] = valueV/10000;
+				a = valueV/10000;
+				valueV = valueV - 10000*(a);
+				dataLedMsg[3] = valueV/1000;
+				a = valueV/1000;
+				valueV = valueV - 1000*(a);
+				dataLedMsg[2] = valueV/100;
+				a = valueV/100;
+				valueV = valueV - 100*(a);
+				dataLedMsg[1] = valueV/10;
+				a = valueV/10;
+				valueV = valueV - 10*(a);
+
+				dataLedSegments[1] |= 0x80;
+				*/
+	}
+	//Blink Decimal Place if units are mili
+	dataLedSegments[1] &= 0x0F;
+	if(miliDecimal == 0 || milidelay > 1)
+	dataLedSegments[1] |= decimalPlace;
+	//update display
+	dataLedMsg[5] = dataLedSegments[1];
+	I2C_Master_Transmit(LED_SLV_ADDR,dataLedMsg,6);
+}
+
+void MSB_Off(void)
+{
+	if(msbOn)
+	{
+		//Turn off first segment
+				dataINAValue[0] = 0x01; 	//Decode Mode Register
+				dataINAValue[1] = 0x07;		//Decode Digits 1,2,3,4 (defaults to 0x00, for no decode)
+				I2C_Master_Transmit(LED_SLV_ADDR,dataINAValue,2);
+	}
+}
+
+void MSB_On(void)
+{
+	if(!msbOn)
+	{
+		//Turn off first segment
+				dataINAValue[0] = 0x01; 	//Decode Mode Register
+				dataINAValue[1] = 0x08;		//Decode Digits 1,2,3,4 (defaults to 0x00, for no decode)
+				I2C_Master_Transmit(LED_SLV_ADDR,dataINAValue,2);
 	}
 }
 
